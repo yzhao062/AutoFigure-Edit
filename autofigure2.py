@@ -1101,13 +1101,30 @@ def _extract_gemini_text(response: Any) -> Optional[str]:
     return None
 
 
+def _coerce_pil_image(value: Any) -> Optional[Image.Image]:
+    """Normalize an `as_image()` result to PIL.Image.
+
+    google-genai 1.74's `Part.as_image()` returns `types.Image` (pydantic,
+    fields: image_bytes/mime_type/gcs_uri), not PIL.Image as the docstring
+    suggests. Decode raw bytes when present so downstream PIL ops work.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Image.Image):
+        return value
+    image_bytes = getattr(value, "image_bytes", None)
+    if isinstance(image_bytes, bytes) and image_bytes:
+        return Image.open(io.BytesIO(image_bytes))
+    return None
+
+
 def _extract_gemini_image(response: Any) -> Optional[Image.Image]:
     """从 Gemini 响应中提取图片（优先使用 part.as_image()）"""
     parts = getattr(response, "parts", None) or []
     for part in parts:
         as_image = getattr(part, "as_image", None)
         if callable(as_image):
-            image = as_image()
+            image = _coerce_pil_image(as_image())
             if image is not None:
                 return image
 
@@ -1127,7 +1144,7 @@ def _extract_gemini_image(response: Any) -> Optional[Image.Image]:
         for part in candidate_parts:
             as_image = getattr(part, "as_image", None)
             if callable(as_image):
-                image = as_image()
+                image = _coerce_pil_image(as_image())
                 if image is not None:
                     return image
     return None

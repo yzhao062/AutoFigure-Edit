@@ -26,3 +26,7 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
+
+.agent-config/
+
+agent-config.local.yaml
