@@ -26,7 +26,12 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
+*.lock
 
 .agent-config/
 
 agent-config.local.yaml
+
+# Personal scratch / paper drafts (kept out of public fork to protect
+# double-blind submission anonymity and keep the fork tooling-focused)
+todo/
