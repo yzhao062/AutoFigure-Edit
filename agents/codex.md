@@ -57,12 +57,11 @@ bash .agent-config/bootstrap.sh
 This bootstrap flow refreshes the consuming repo's root `AGENTS.md` on every run: by default it composes the shared upstream copy with the `agent-style` rule pack (requires Python 3 + PyYAML; bootstrap attempts a best-effort `pip install --user pyyaml` when missing). When rule-pack composition is disabled (`rule_packs: []` in `agent-config.yaml`) or unavailable (Python or PyYAML absent after the auto-install attempt), the root `AGENTS.md` is written verbatim from the shared upstream copy. If a project later needs repo-local overrides, put them in `AGENTS.local.md`.
 
 Read and follow the rules in `.agent-config/AGENTS.md` as baseline defaults. Any rule in `AGENTS.local.md` overrides the shared default.
-When a skill is invoked, read its SKILL.md from `.agent-config/repo/skills/<skill-name>/SKILL.md`.
-If a local `skills/<skill-name>/SKILL.md` exists in the project repo, the local copy takes precedence.
+When a skill is invoked, resolve its `SKILL.md` using this order, first hit wins: `skills/<skill-name>/SKILL.md` (project-local), then `.claude/skills/<skill-name>/SKILL.md` (pack-deployed by `anywhere-agents pack install`; `.claude/` prefix is a historical Claude Code convention but the contents are agent-agnostic), then `.agent-config/repo/skills/<skill-name>/SKILL.md` (bootstrapped from upstream).
 Copying `.agent-config/repo/.claude/commands/*.md` only overwrites command files with the same name as the shared repo and does not delete unrelated project-local commands.
 Merge shared Claude project defaults (e.g., `permissions`, `attribution`) from `.agent-config/repo/.claude/settings.json` into the project `.claude/settings.json`. Shared keys are updated on every bootstrap run; project-only keys are preserved. Merge requires Python; if unavailable the existing file is left untouched.
 Add `.agent-config/` to the project's `.gitignore` so fetched files are not committed.
-Bootstrap also sets up user-level config: it copies `scripts/guard.py` to `~/.claude/hooks/` (a PreToolUse hook that guards against destructive commands) and merges `user/settings.json` into `~/.claude/settings.json` (shared permissions, hook wiring, and the `CLAUDE_CODE_EFFORT_LEVEL=max` env entry that sets the default effort level). Remove the user-level section from the bootstrap script if this is not wanted.
+Bootstrap also sets up user-level config: it copies `scripts/guard.py` to `~/.claude/hooks/` (a PreToolUse hook that guards against destructive commands) and `scripts/statusline.py` to `~/.claude/statusline.py` (a statusLine renderer showing Claude Max + Codex 5h / weekly quota), and merges `user/settings.json` into `~/.claude/settings.json` (shared permissions, hook wiring, statusLine command, and the `CLAUDE_CODE_EFFORT_LEVEL=max` env entry that sets the default effort level). Remove the user-level section from the bootstrap script if this is not wanted.
 ````
 
 ### What gets shared
@@ -74,15 +73,15 @@ Bootstrap also sets up user-level config: it copies `scripts/guard.py` to `~/.cl
 | Shared skills (`implement-review`, `my-router`, `ci-mockup-figure`, `readme-polish`) | `skills/` directory (committed only) | sparse `git clone` |
 | Claude pointer commands for shared skills | `.claude/commands/` | sparse `git clone` plus non-destructive copy into the project `.claude/commands/` |
 | Claude project defaults (`permissions`, `attribution`, etc.) | `.claude/settings.json` | sparse `git clone` plus key-level merge into the project `.claude/settings.json` on every run |
-| User-level hooks (`guard.py`, `session_bootstrap.py`) + settings | `scripts/` + `user/settings.json` | Scripts copied to `~/.claude/hooks/`; settings merged into `~/.claude/settings.json` (shared permissions, PreToolUse guard, SessionStart bootstrap hook, `CLAUDE_CODE_EFFORT_LEVEL=max`) |
+| User-level scripts (`guard.py`, `session_bootstrap.py`, `statusline.py`) + settings | `scripts/` + `user/settings.json` | Hooks copied to `~/.claude/hooks/`, statusline to `~/.claude/statusline.py`; settings merged into `~/.claude/settings.json` (shared permissions, PreToolUse guard, SessionStart bootstrap hook, statusLine command, `CLAUDE_CODE_EFFORT_LEVEL=max`) |
 
 ### Override rules
 
 - If `AGENTS.local.md` exists in the project root, read and follow it after `AGENTS.md`. Rules in `AGENTS.local.md` override the shared defaults.
 - Rules in `AGENTS.local.md` always win over shared defaults. Do not edit the root `AGENTS.md` for local overrides, as bootstrap will overwrite it.
-- Project-local `skills/<name>/SKILL.md` always wins over the shared copy of the same skill.
+- Project-local `skills/<name>/SKILL.md` always wins over pack-deployed and bootstrapped copies of the same skill.
 - Shared keys in `.claude/settings.json` are updated on every bootstrap run. Project-only keys are preserved. To override a shared key locally, use `.claude/settings.local.json`.
-- If a shared skill does not exist locally, the agent should use the fetched copy from `.agent-config/repo/skills/`.
+- If no project-local copy exists, use `.claude/skills/<name>/SKILL.md` when present; otherwise use the fetched shared copy from `.agent-config/repo/skills/`.
 
 ### Configuration Precedence
 
@@ -117,7 +116,7 @@ The generated `CLAUDE.md` and `agents/codex.md` carry a `GENERATED FILE` header.
 1. If `session-event.json.ts > banner-emitted.json.ts`, OR `session-event.json` exists but `banner-emitted.json` does not: emit the session start banner as the **literal first content of your response**, then write the event `ts` into `<project-root>/.agent-config/banner-emitted.json`. Only after the banner text may you address the user's request on the same turn.
 2. Otherwise (emitted `ts` is already current, or neither file exists): skip the banner this turn.
 
-`session_bootstrap.py` writes `session-event.json` on every SessionStart hook fire (fresh startup, resume, clear, compact), so the banner reappears across all four lifecycle events. Flag files are per-project, so opening multiple Claude Code windows in different consumer repos does not cause cross-session interference.
+`session_bootstrap.py` writes `session-event.json` on SessionStart hook fires whose `source` is `startup`, `resume`, or `clear`, so the banner reappears across the three lifecycle events that reset conversation context. On `source: compact`, the prior banner ack survives in the summarized context, so the hook skips the event write and the banner does not re-fire. A 10-second debounce suppresses duplicate event writes when the hook fires twice in rapid succession for the same lifecycle event. Flag files are per-project, so opening multiple Claude Code windows in different consumer repos does not cause cross-session interference.
 
 **In a source repo (`agent-config` or `anywhere-agents`, no `.agent-config/` at the root):** the banner gate in `guard.py` is not active and the flag-file mechanism does not apply. Emit the banner on the first response of the session (turn with no prior assistant turns in context); skip on subsequent turns. Compact / resume / clear cannot be mechanically distinguished here.
 
@@ -132,38 +131,35 @@ The generated `CLAUDE.md` and `agents/codex.md` carry a `GENERATED FILE` header.
    ├── OS: <platform>
    ├── Claude Code: <version>[ → <latest>] (auto-update: <on|off>) · <model> · effort=<level>
    ├── Codex: <version>[ → <latest>] · <model> · <reasoning> · <tier> · fast_mode=<bool>
-   ├── Skills: <N> local (<names>) + <M> shared (<names>)
+   ├── Skills: <N> local (<names>) + <P> pack (<names>) + <M> shared (<names>)
    ├── Hooks: PreToolUse <guard.py>, SessionStart <session_bootstrap.py>
    └── Session check: all clear
 ```
 
-If anything is off, replace `all clear` with a semicolon-separated list of concrete issues, each actionable in one short clause (e.g., `⚠ actions/checkout@v4 in .github/workflows/validate.yml:17 — bump to v5; Codex config.toml missing model key`). Keep the whole banner to six lines plus the check line. The skills row may wrap visually when many names are present; do not omit a local or shared bucket just to preserve terminal width.
+If anything is off, replace `all clear` with a semicolon-separated list of concrete issues, each actionable in one short clause (e.g., `⚠ actions/checkout@v4 in .github/workflows/validate.yml:17 — bump to v5; Codex config.toml missing model key`). Keep the whole banner to six lines plus the check line. The skills row may wrap visually when many names are present; do not omit a local, pack, or shared bucket just to preserve terminal width.
 
 ### How to populate each field
 
 1. **OS** — read from the session environment (`win32`, `darwin`, `linux`). Use this elsewhere to pick platform-specific behavior (terminal review path on Windows, MCP on macOS/Linux, `.ps1` vs `.sh`).
 2. **Claude Code** — format: `Claude Code <current>[ → <latest>] (auto-update: <on|off>) · <model> · effort=<level>`. Current version comes from Claude Code's startup header or `claude --version`. Read `~/.claude/hooks/version-cache.json` for `claude_latest`; render ` → <latest>` **only when current differs** from latest. Determine `auto-update: on` when `DISABLE_AUTOUPDATER` is not `1` in the effective env (OS env or `env` block in `~/.claude/settings.json`) AND `~/.claude.json` top-level `autoUpdates` is not explicitly `false` — a missing key counts as `on` because native installs auto-update by default. Only explicit `autoUpdates: false` (which bootstrap heals on the next run) or the disable env var means `off`. User prefers the highest available model at max effort; flag any drift once in the banner, not every turn.
 3. **Codex** — format: `Codex <current>[ → <latest>] · <model> · <reasoning> · <tier> · fast_mode=<bool>`. Current version from `codex --version`. Latest from `~/.claude/hooks/version-cache.json` `codex_latest` (render ` → <latest>` only when current differs). Config from `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows): `model` · `model_reasoning_effort` · `service_tier` · `[features].fast_mode`. Expected values: `model = "gpt-5.5"` (or latest), `model_reasoning_effort = "xhigh"`, `service_tier = "fast"`, `[features] fast_mode = true`. If the binary is not on PATH, show `Codex: not installed`. If the binary exists but `config.toml` is missing, show version + `not configured` in place of the config summary.
-4. **Skills** — list both active sets. Count directories under `skills/` (project-local) and `.agent-config/repo/skills/` (bootstrapped). For the shared count/list, exclude any shared skill whose name also exists under project-local `skills/`, because project-local overrides shared on name conflict. Format: `<N> local (<names>) + <M> shared (<names>)`. Omit either half if empty (e.g., `4 shared (...)` when the consumer has no project-local `skills/`).
+4. **Skills** — list all active skill buckets. Count directories under `skills/` (project-local), `.claude/skills/` (pack-deployed by `anywhere-agents pack install`), and `.agent-config/repo/skills/` (bootstrapped from upstream). Apply the lookup precedence from "Local Skills Precedence" when counting: exclude pack-deployed names that are shadowed by a project-local skill, and exclude bootstrapped names that are shadowed by either a project-local or a pack-deployed skill. Format: `<N> local (<names>) + <P> pack (<names>) + <M> shared (<names>)`. Omit empty buckets (e.g., `2 pack (...) + 4 shared (...)` when the consumer has no project-local skills, or `4 shared (...)` when only the bootstrapped bucket is non-empty).
 5. **Hooks** — check `~/.claude/hooks/` for `guard.py` (PreToolUse) and `session_bootstrap.py` (SessionStart). If one is missing, include it in the Session check line as an issue.
 6. **Session check** — scan `.github/workflows/*.yml` for action version pins below the minimums in the GitHub Actions Standards section. Combine with any Codex-config or hook drift detected above. Emit `all clear` only when nothing needs attention.
 
-7. **Pack deployment** — perform this check exactly:
+7. **Pack deployment** — compute two counts:
 
-    a. Read user-level config: on Windows `%APPDATA%\anywhere-agents\config.yaml`; on POSIX `$XDG_CONFIG_HOME/anywhere-agents/config.yaml`, default `~/.config/anywhere-agents/config.yaml`. If absent, `user_packs = []`.
+    **a. user_packs**: read `%APPDATA%\anywhere-agents\config.yaml` (Windows) or `$XDG_CONFIG_HOME/anywhere-agents/config.yaml` / `~/.config/anywhere-agents/config.yaml` (POSIX); empty list if absent. `AGENT_CONFIG_PACKS` env var is excluded.
 
-    b. Read durable project config: `agent-config.yaml` then merge `agent-config.local.yaml` overrides by name. `AGENT_CONFIG_PACKS` env var is **excluded**. If both files absent, `project_packs = []`.
+    **b. project_packs**: read `agent-config.yaml` then merge `agent-config.local.yaml` by name; if both are absent, use an empty list. Local entries win on duplicates.
 
-    c. For each pack `u` in `user_packs`, normalize its identity tuple `(u.name, normalize_pack_source_url(u.source.url), u.source.ref)`. Find any pack `p` in `project_packs` with the same `u.name` (case-sensitive name match). If `project_packs` contains duplicate-named entries (e.g., the same name in both `agent-config.yaml` and `agent-config.local.yaml`), apply local-overrides-tracked: keep only the local entry. Count `u` toward `gap_count` if either: no matching `p` exists, OR `p`'s normalized identity tuple differs from `u`'s.
+    **c. gap_count**: for each `u` in user_packs, normalize `(name, normalize_pack_source_url(url), ref)`. Increment if no matching `p` in project_packs by case-sensitive name, OR if `p`'s normalized tuple differs from `u`'s.
 
-    d. Read `.agent-config/pack-lock.json` (the project-local lock written by the composer). For each entry in `data.packs`, count it toward `update_count` when **both** `latest_known_head` and `resolved_commit` are non-empty strings AND `latest_known_head != resolved_commit`. The optional `latest_known_head` / `fetched_at` fields land via `pack verify` (which runs `git ls-remote` opportunistically and lock-bracket-merges the result) and via composer fetches at install time. Old locks predating v0.5.2 omit both fields and contribute zero — no migration needed.
+    **d. update_count**: for each entry in `.agent-config/pack-lock.json` `data.packs`, increment when both `latest_known_head` and `resolved_commit` are non-empty AND they differ. (Lock entries predating v0.5.2 lack these fields and contribute zero.)
 
-    e. Compose the banner contribution from both counts. Each is a half-clause; drop the half whose count is 0; emit `all clear` only when both are 0:
-
-       - `gap_count > 0` → ``⚠ <gap_count> user-level pack(s) not deployed (run `anywhere-agents pack verify --fix`)``
-       - `update_count > 0` → ``ℹ <update_count> pack update(s) available (run `anywhere-agents pack verify --fix`)``
-
-       Append the surviving half-clauses to the Session check line, semicolon-separated. The CLI command differs from v0.5.1: v0.5.2 collapses the verify-then-bootstrap dance into `pack verify --fix`, which now invokes the composer subprocess after writing config rows.
+    **e. emit**: each non-zero count contributes a half-clause to the Session check line (semicolon-separated; `all clear` when both zero):
+    - gap_count > 0 → ``⚠ <gap_count> user-level pack(s) not deployed (run `anywhere-agents pack verify --fix`)``
+    - update_count > 0 → ``ℹ <update_count> pack update(s) available (run `anywhere-agents pack verify --fix`)``
 
 ## User Profile
 
@@ -177,29 +173,38 @@ If anything is off, replace `all clear` with a semicolon-separated list of concr
 - **Codex** is the gatekeeper: review, feedback, and quality checks on work produced by Claude Code or the user.
 - When both agents are available, default to this division of labor unless the user overrides it.
 
+## Agent Fungibility
+
+- The default routing (Claude Code primary, Codex gatekeeper) is a default, not a hard requirement. Two scenarios must remain workable: (1) **absence**, when one agent is unavailable (service outage, regional block, quota exhaustion, hardware-induced refusal); (2) **reversal testing**, when the user deliberately swaps primary and gatekeeper roles to evaluate quality drift.
+- **Principle**: not 1:1 replication. Core functions must work when either agent is absent or when roles are reversed. Where an ergonomic helper exists for one agent only (e.g., a hand-crafted slash command), the function must still be reachable via underlying primitives. Define "core function" by user value (review loop, structured dispatch, health check), not by surface convenience.
+- **How to apply** when designing or refactoring agent-facing skills, scripts, or docs:
+  - Default routing is fine; just make the alternative reachable.
+  - A skill, hook, or script that hard-codes one agent's CLI (`codex exec`, `claude -p`) should document or wire the other side's equivalent at the same time, even if the implementation is deferred.
+  - Docs that name one agent in step instructions should call out the cross-vendor equivalent at least once near the top, so a session reading the doc under role reversal can still proceed.
+  - When the deferred half ships later, the principle is satisfied; do not block the primary half on simultaneous parity.
+
+## Memory and Persistence
+
+- This configuration targets multi-agent use (Claude Code, Codex, and others). A single agent's private memory is therefore not a reliable home for durable context: one agent's per-account memory is not readable by the other agents, and it does not travel across accounts or machines.
+- Prefer version-controlled local files for anything that must persist across agents, sessions, accounts, or machines: the project `README`, a `docs/` note, a `PLAN-*.md` or notes file, a `CHANGELOG`, or `AGENTS.local.md`. Version control is the portable, agent-independent memory.
+- Use an agent's built-in memory only for short, agent-local convenience, and treat the version-controlled copy as authoritative. Do not record project state, decisions, or records solely in agent memory.
+
 ## Task Routing
 
-- Before starting a task, read the router skill to determine which domain skill to use. Look for it in this order: `skills/my-router/SKILL.md` (repo-local), then `.agent-config/repo/skills/my-router/SKILL.md` (bootstrapped from shared config).
+- Before starting a task, read the router skill to determine which domain skill to use. Look for it in this order: `skills/my-router/SKILL.md` (repo-local), then `.claude/skills/my-router/SKILL.md` (pack-deployed), then `.agent-config/repo/skills/my-router/SKILL.md` (bootstrapped from shared config).
 - The router inspects prompt keywords, file types, and project structure to dispatch automatically. Do not ask the user which skill to use when the routing table provides a clear match.
 - If the `superpowers` plugin is active, the router operates during the execution phase. Superpowers handles the outer workflow (brainstorm, plan, execute, verify); the router handles inner dispatch to the right domain skill.
 - If routing is ambiguous (multiple skills could apply), state the detected context and proposed skill, then ask the user to confirm.
 
 ## Codex MCP Integration
 
-- Codex is available to Claude Code as an MCP server. Register it once at the user level so it applies to all projects and terminals (including PyCharm):
+- Codex can run as an MCP server callable from Claude Code. Register at user scope (NOT project scope; project-scoped entries do not propagate across directories):
   ```
   claude mcp add codex -s user -- codex mcp-server -c approval_policy=never
   ```
-- This writes to `~/.claude.json` top-level `mcpServers`. A session restart is required after registration for `/mcp` to pick it up.
-- **Migrating an existing registration:** If Codex was registered with the deprecated `on-failure` policy or without `-c approval_policy=never`, remove and re-add:
-  ```
-  claude mcp remove codex -s user
-  claude mcp add codex -s user -- codex mcp-server -c approval_policy=never
-  ```
-  On Windows, adjust the path as shown below.
-- **Gotcha:** Do not register under a project scope (e.g., from a specific working directory without `-s user`). That creates a project-scoped entry under `projects["<path>"].mcpServers` in `~/.claude.json`, which does not propagate to other directories.
-- Prerequisites: Node.js installed, Codex CLI installed (`npm install -g @openai/codex`), and `OPENAI_API_KEY` set.
-- **Recommended Codex defaults (as of April 2026):** Add or update these keys in `~/.codex/config.toml` on macOS/Linux or `%USERPROFILE%\.codex\config.toml` on Windows (create the file if it does not exist) so that both interactive sessions and the MCP server use the recommended default model with fast inference:
+  Writes to `~/.claude.json` `mcpServers`; session restart required for `/mcp` to pick it up. Available MCP tools after registration: `codex` (new prompt) and `codex-reply` (continue an existing session).
+- Prerequisites: Node.js + Codex CLI (`npm install -g @openai/codex`) + `OPENAI_API_KEY`.
+- **Recommended Codex defaults** (added to `~/.codex/config.toml` on POSIX or `%USERPROFILE%\.codex\config.toml` on Windows; the MCP server reads the same file as interactive sessions):
   ```toml
   model = "gpt-5.5"
   model_reasoning_effort = "xhigh"
@@ -207,22 +212,15 @@ If anything is off, replace `all clear` with a semicolon-separated list of concr
 
   [features]
   fast_mode = true
+
+  [desktop]
+  conversationDetailMode = "DEFAULT"
   ```
-  `service_tier = "fast"` selects the fast inference tier (1.5x speed, no quality reduction). For ChatGPT-authenticated users this costs 2x credits; API-key users pay standard API pricing. The `[features].fast_mode` flag gates the feature and defaults to `true`; set it explicitly alongside `service_tier` to persist the default in `config.toml`. Omit both if you prefer lower cost over latency. The MCP server reads the same `config.toml`, so these settings apply to both interactive sessions and MCP. These settings work identically on macOS, Linux, and Windows.
-- MCP tools available after registration: `codex` (new prompt) and `codex-reply` (continue an existing session).
-- **Windows note:** Claude Code launches MCP servers through bash, not cmd or PowerShell. This means `.cmd` wrappers and PowerShell variables like `$env:APPDATA` do not work. If `codex` is not on `PATH`, use the full path with forward slashes and **no `.cmd` extension** (npm installs a bash-compatible script alongside the `.cmd`):
-  ```
-  claude mcp add codex -s user -- C:/Users/<you>/AppData/Roaming/npm/codex mcp-server -c approval_policy=never
-  ```
-  Run `where codex` (cmd) or `Get-Command codex` (PowerShell) to find the actual path.
-- **MCP approval policy:** By default the Codex MCP server can prompt for approval on shell commands, which surfaces as "MCP server requests your input" dialogs in Claude Code. Pass `-c approval_policy=never` in the registration command (shown above) so the MCP server never asks for per-command approval; command failures return to Codex/Claude as tool errors. This trades away the deprecated `on-failure` retry prompt for unattended MCP operation. Claude Code's PreToolUse hooks still gate the outer MCP tool call, but they do not inspect each shell command that Codex runs inside the MCP server. Keep Codex sandboxing, repo rules, and command review discipline aligned with that trust boundary. For interactive Codex terminal sessions, prefer `approval_policy = "on-request"` in `~/.codex/config.toml`.
-- **Bitdefender false positives (Windows):** Bitdefender Advanced Threat Defense may flag Codex and Claude Code shell commands as "Malicious command lines detected." To suppress this, add exceptions in Bitdefender → Protection → Manage Exceptions. For each exception, enable the **Advanced Threat Defense** toggle (not just Antivirus). Recommended exceptions:
-  - `C:\Program Files\nodejs\node.exe` (process)
-  - `C:\Users\<you>\.local\bin\claude.exe` (process)
-  - `C:\Users\<you>\AppData\Roaming\npm\codex` (process)
-  - `C:\Users\<you>\AppData\Roaming\npm\codex.cmd` (process)
-  - `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe` (process, if Codex invokes PowerShell)
-- **Windows recommendation: use the terminal path.** On Windows (11 Build 26200+), the MCP path still has rough edges — residual approval prompts and Bitdefender false positives add friction even after the mitigations above. The terminal path (relay reviews via the Codex interactive terminal window) avoids both issues. Prefer the terminal path on Windows; use MCP on macOS/Linux where it works smoothly.
+  `service_tier = "fast"` enables 1.5x-speed inference (2x credits for ChatGPT auth; standard API pricing for API key); omit if cost matters more than latency.
+  `conversationDetailMode = "DEFAULT"` keeps Codex terminal output concise; avoid `STEPS_PROSE` / Coding mode unless you explicitly want command-level progress shown during turns.
+- **Windows PATH note**: Claude Code launches MCP servers through bash, not cmd or PowerShell, so `.cmd` wrappers and `$env:APPDATA` do not work. If `codex` is not on bash PATH, register with the full path using forward slashes and NO `.cmd` extension (e.g., `C:/Users/<you>/AppData/Roaming/npm/codex`). Run `where codex` (cmd) or `Get-Command codex` (PowerShell) to find it.
+- **`approval_policy=never` rationale**: without it, MCP shell commands trigger "MCP server requests your input" dialogs in Claude Code. With it, failures return to Codex/Claude as tool errors. Claude Code's PreToolUse hooks still gate the outer MCP tool call. For interactive Codex terminal sessions (NOT MCP), prefer `approval_policy = "on-request"` in `config.toml`.
+- **Windows recommendation: prefer the terminal path over MCP.** On Windows (11 Build 26200+), MCP has residual rough edges (approval prompts, AV false positives). The terminal path (Codex interactive window for reviews) avoids both. Prefer terminal on Windows; MCP is smoother on macOS/Linux.
 
 ## Writing Defaults
 
@@ -246,6 +244,8 @@ If anything is off, replace `all clear` with a semicolon-separated list of concr
 - Avoid heavy dash use. Do not use em dashes (`—`) or en dashes (`–`) as casual sentence punctuation. Prefer commas, semicolons, colons, or parentheses instead. En dashes in numeric ranges (e.g., `1–3`, `2020–2025`), paired names, or citations are fine. Normal hyphenation in compound words and technical terms (e.g., `command-line`, `co-PI`, `zero-shot`) is fine and should not be avoided.
 - Break extremely long or complex sentences into shorter, more readable ones. If a sentence has multiple clauses or nested qualifications, split it.
 - Vary sentence length and structure. Prefer not to start several consecutive sentences with the same word or phrase. Avoid overusing transition words like "Additionally" or "Furthermore." Not every paragraph needs a tidy summary sentence at the end. Mix short, direct sentences with longer ones to keep the writing natural.
+- Do not stage claims as "X, not Y" antithesis for emphasis (also "not just X, but Y"; "it is not X, it is Y"). State the claim directly. Keep the negation only when the rejected alternative is specific and the contrast informs the reader (e.g., "the bottleneck is disk I/O, not CPU").
+- When showing the user text whose purpose is to be copied into an external destination (an email reply, a chat message, a spreadsheet or table cell, a document), present that text in a fenced code block so it copies cleanly with line breaks and formatting intact. This applies to copy-paste-destined drafts, not to ordinary explanatory answers.
 
 ## Git Safety
 
@@ -259,15 +259,29 @@ Bootstrap deploys `scripts/guard.py` to `~/.claude/hooks/guard.py` and wires it 
 
 | Gate | Tool scope | Trigger | Action |
 |---|---|---|---|
-| Writing-style | `Write`, `Edit`, `MultiEdit` on `.md` / `.tex` / `.rst` / `.txt` | Outgoing content contains a banned AI-tell word (see Writing Defaults list) | **deny** with hit list |
-| Banner emission | Any tool except `Read`, `Grep`, `Glob`, `Skill`, `Task`, `TodoWrite`, `BashOutput`, `WebFetch`, `WebSearch`, `ToolSearch`, `LS`, `NotebookRead`; plus `Write`/`Edit`/`MultiEdit` whose target path exactly equals `<project-root>/.agent-config/banner-emitted.json` after absolute-path normalization and Windows case folding | `<project-root>/.agent-config/session-event.json.ts > <project-root>/.agent-config/banner-emitted.json.ts`. `<project-root>` is found by walking up from `cwd` until `.agent-config/bootstrap.{sh,ps1}` is present. Source repos (no `.agent-config/`) and unrelated directories skip the gate entirely | **deny** with instruction to emit banner + write acknowledgment to the per-project ack file |
-| Compound `cd` | `Bash` | Command contains `cd <path> && <cmd>` or `cd <path>; <cmd>` | **deny** with suggestion to use `git -C` or path arguments |
-| Destructive git | `Bash` | `git push`, `git commit`, `git merge`, `git rebase`, `git reset --hard`, `git clean`, `git branch -d/-D`, `git tag -d`, `git stash drop/clear` | **ask** (user confirms) |
-| Destructive gh | `Bash` | `gh pr create`, `gh pr merge`, `gh pr close`, `gh repo delete` | **ask** (user confirms) |
+| Writing-style | `Write`, `Edit`, `MultiEdit` on `.md` / `.tex` / `.rst` / `.txt` | Outgoing content contains a banned AI-tell word (see Writing Defaults list) | **deny** with hit list and inline `Suggested rewrite:` line naming concrete alternatives |
+| Banner emission | Any tool except `Read`, `Grep`, `Glob`, `Skill`, `Task`, `TodoWrite`, `BashOutput`, `WebFetch`, `WebSearch`, `ToolSearch`, `LS`, `NotebookRead`; plus `Write`/`Edit`/`MultiEdit` whose target path exactly equals `<project-root>/.agent-config/banner-emitted.json` after absolute-path normalization and Windows case folding | `<project-root>/.agent-config/session-event.json.ts > <project-root>/.agent-config/banner-emitted.json.ts`. `<project-root>` is found by walking up from `cwd` until `.agent-config/bootstrap.{sh,ps1}` is present. Source repos (no `.agent-config/`) and unrelated directories skip the gate entirely | **first arm** (banner-emitted.json absent): **deny** with instruction to emit banner + write acknowledgment to the per-project ack file. **Re-arm** (ack file exists but ts is stale, including malformed JSON): pass-through with a `[banner-gate] SessionStart re-fire detected ...` advisory line on stderr. The agent should still re-emit the banner on its next textual response per the rule in § "Session Start Check", but tool calls are not blocked (issue anywhere-agents#7). |
+| Compound `cd` | `Bash` | Command contains `cd <path> && <cmd>` or `cd <path>; <cmd>` | **deny** with inline `Suggested rewrite:` line (e.g. `git -C <path> <cmd>` for git, or pass the path as an argument) |
+| Destructive git | `Bash` + `PowerShell` | `git push`, `git commit`, `git merge`, `git rebase`, `git reset --hard`, `git clean`, `git branch -d/-D`, `git checkout --`, `git tag -d`, `git stash drop/clear` | **ask** (user confirms) |
+| Destructive / publish gh | `Bash` + `PowerShell` | `gh pr create/merge/close`, `gh repo delete`, `gh release create/delete/upload/edit` | **ask** (user confirms) |
+| Publish | `Bash` + `PowerShell` | `npm publish`, `npm unpublish`, `twine upload`, `python -m twine upload` | **ask** (user confirms) |
+| File / device destruction | `Bash` + `PowerShell` | Bash `rm -rf`/`-fr`/`-r -f`, `dd`, `mkfs*`, `shred`; PowerShell `Remove-Item` (+ aliases `rm`/`del`/`rd`/`rmdir`) with `-Recurse`/`-r`/`/s` | **ask** (user confirms) |
 
-**Escape hatch:** set env var `AGENT_CONFIG_GATES=off` (or `0`/`disabled`/`false`) via the `env` block in `~/.claude/settings.json` to disable the two new gates (writing-style and banner). The compound-cd / destructive-git / destructive-gh checks remain active regardless, since they guard against muscle-memory mistakes that do not tolerate false positives.
+**Mandatory risk classification (tool-agnostic):** the four `ask` rows above are one classifier that runs for the `Bash` AND `PowerShell` tools (legacy payloads count as Bash). It keys on the EXACT leading token of each sub-command (split on `;` / `&&` / `||` / `|`), never a substring scan, so quoted strings like `echo "rm -rf"` or `Write-Output "Remove-Item -Recurse"` pass. It strips transparent prefix runners (`sudo`, `doas`, `env`, `command`, `nohup`, `setsid`, inline `VAR=VALUE`) and sees through built-in command-carrying wrappers (`ssh`, `bash`/`sh`/`zsh -c`, `docker exec`/`run`, `pwsh`/`powershell -Command`, Windows `cmd /c`/`/k`, `timeout`, `xargs`) up to `MAX_WRAPPER_DEPTH`, asking when nesting exceeds it. `python -c`, the low-frequency prefixes `nice`/`ionice`/`stdbuf`/`time`, and custom/private wrappers (a personal job-runner, etc.) are treated as **opaque** documented non-goals: their argument semantics are not inferable from the command text, and substring-scanning arbitrary arguments would reintroduce false-positive alarm fatigue. The user-level allow-list pairs `Bash(*)` with `PowerShell(*)`, so the native permission layer is allow-by-default and this hook is the sole risk arbiter on both shells.
 
-Setting the escape hatch is the right move when a legitimate write has a banned word in *meta-discussion* context (for example, a style-guide document that quotes banned words as examples of what to avoid), or when a prompt-layer failure is blocking legitimate work. Fix the false positive, then remove the override.
+**Round 6 noise audit (v0.7.0):** Deny messages embed a concrete `Suggested rewrite:` line so an autonomous agent (`/implement-review auto`, headless `claude -p`, any unattended loop) can lift the reroute in one model turn instead of inferring it. Destructive operations stay `ask` because they have no agent-side reroute; human approval is the contract.
+
+**Escape hatches:** set the corresponding env var in the `env` block of `~/.claude/settings.json`. Disable values: `off` / `0` / `disabled` / `false` / `no`.
+
+| Env var | Disables |
+|---|---|
+| `AGENT_STYLE_HOOK=off` | Writing-style gate only |
+| `AGENT_COMPOUND_CD_HOOK=off` | Compound-cd gate only |
+| `AGENT_CONFIG_GATES=off` | Legacy blanket: writing-style + banner only (BC-preserved) |
+
+**The mandatory risk set (destructive git, destructive/publish gh, package publishes, file/device destruction) is NOT bypassable by ANY env var.** No escape hatch turns the `ask` prompt into pass-through. The guards have no automatic reroute; human approval is the contract. The advertised env-var set lives in `scripts/guard.py:_ESCAPE_HATCH_ENV_NAMES`; a static literal-scan test enforces that no future hook env var can be added without registering it there.
+
+Set a per-guard escape env when a legitimate write has a banned word in *meta-discussion* context (a style-guide document that quotes banned words as examples; a CHANGELOG entry that cites one). Prefer the narrowest env that unblocks (`AGENT_STYLE_HOOK=off` over `AGENT_CONFIG_GATES=off`) so the other gates stay live. Remove the override after the write.
 
 ## Shell Command Style
 
@@ -277,7 +291,13 @@ Setting the escape hatch is the right move when a legitimate write has a banned 
 - Examples of read-only invocations that should not require approval: `git status`, `git diff`, `git log`, `git branch` (no flags), `git show`, `git stash list`, `git remote -v`, `git submodule status`, `git ls-files`, `git tag --list`. Filesystem reads (`ls`, `cat`) and benign local operations (`mkdir`) are also fine.
 - Examples of invocations that always require explicit approval: `git commit`, `git push`, `git reset`, `git checkout`, `git rebase`, `git merge`, `git branch -d`, `git remote add/remove`, `git tag <name>` (creating/deleting), `git stash drop`.
 - Filesystem commands like `cp` and `mv` are fine for scratch and temporary files. Moves or renames that affect git-tracked files should be reviewed before executing.
+- **Do not wrap PowerShell inside PowerShell with inline `-Command` when the payload contains `$` variables.** In a PowerShell shell, run the PowerShell body directly, or write a temporary `.ps1` and invoke it with `-File`. Forms like `pwsh.exe -Command "foreach($f in ...) { ... }"` cause the outer shell to expand `$f`, `$_`, and `$cutoff` before the inner shell runs, producing broken commands.
 - **Avoid inline Python with `#` comments in quoted arguments.** Claude Code flags "newline followed by `#` inside a quoted argument" as a path-hiding risk and prompts for approval. Instead, write the code to a `.py` file and run `python <script>.py`.
+
+## Tool-Use Reliability
+
+- Treat a tool's "cannot open / encrypted / unreadable / unsupported" report on a file as a possible false positive, not a final verdict. PDFs are the common case: a read may report a PDF as encrypted when it actually opens fine. Before telling the user a file cannot be read, retry once and try an alternate read path (re-read with a page range, `pdftotext`, render to an image, or a different tool). Report failure only after an alternate path also fails, and say which paths were tried.
+- The same caution applies to other transient-looking tool failures: a single failed attempt is weak evidence. Prefer one retry or an alternate route over reporting a blocked result, unless the failure is clearly deterministic.
 
 ## GitHub Actions Standards
 
@@ -302,7 +322,11 @@ When the session start check (item 4) detects older versions, list the affected 
 ## Local Skills Precedence
 
 - If the workspace contains a `skills/` directory, treat repo-local skills as the default source of truth for that project.
-- When a task matches a skill name and both a repo-local `skills/<skill-name>/SKILL.md` and an installed global skill exist, prefer the repo-local skill.
+- **Skill lookup order** for every agent (Claude Code, Codex, or any future agent): when resolving a skill by name, try paths in this order, first hit wins:
+  1. `skills/<skill-name>/SKILL.md`: project-local, hand-authored or vendored.
+  2. `.claude/skills/<skill-name>/SKILL.md`: pack-deployed by `anywhere-agents pack install`. The `.claude/` prefix is a historical Claude Code convention; the SKILL.md contents are agent-agnostic. A v1.0 architecture pass is the right place to revisit the directory name.
+  3. `.agent-config/repo/skills/<skill-name>/SKILL.md`: shared config bootstrapped from upstream.
+  This is the same lookup order encoded in the Claude Code slash-command pointers at `.claude/commands/<name>.md` (per the issue #6 fix), so an agent reading either the pointer file or this rule resolves the same skill the same way.
 - When using a repo-local skill, read `skills/<skill-name>/SKILL.md` and its local `references/`, `scripts/`, and `assets/` before falling back to any globally installed copy.
 - Do not modify a globally installed skill when a repo-local skill of the same name exists, unless the user explicitly asks to update the global copy too.
 - If a repo-local skill overrides a global skill, state briefly that the local project copy is being used.
@@ -311,12 +335,13 @@ When the session start check (item 4) detects older versions, list the affected 
 
 - Skills under `skills/` are shared between coding agents (Codex, Claude Code, and any future agent).
 - `skills/<skill-name>/SKILL.md` is the single source of truth for each skill. Agent-specific config files (e.g., `agents/openai.yaml`) are thin wrappers and must not duplicate or override the logic in `SKILL.md`.
-- Claude Code accesses these skills via pointer commands in `.claude/commands/`. Each pointer file references the corresponding `SKILL.md` rather than duplicating its content.
+- Claude Code has an ergonomic helper: slash-command pointers in `.claude/commands/<name>.md`. Each pointer file references the corresponding `SKILL.md` rather than duplicating its content. Codex and other agents reach the same `SKILL.md` content via the documented "Local Skills Precedence" lookup order above; no slash-command equivalent is required.
+- Pack-deployed skills (third-party packs installed by `anywhere-agents pack install`) land under `.claude/skills/<name>/` as a cross-agent location. The directory name carries a historical Claude Code prefix; the SKILL.md contents are agent-agnostic and resolvable by Codex through the same lookup order. A future plan-review pass on `pack-architecture.md` is the right place to consider renaming the location to a vendor-neutral path.
 - Bootstrap sync should copy only the shared repo's `.claude/commands/*.md` files into the project `.claude/commands/` directory and should not delete unrelated project-local commands.
 - When editing a skill, modify `SKILL.md` and its `references/` or `scripts/` directly. Do not create agent-specific forks of the same content.
-- If a new skill is added, create both the `skills/<skill-name>/SKILL.md` structure and a matching `.claude/commands/<skill-name>.md` pointer so both agents can use it immediately.
+- If a new skill is added, create both the `skills/<skill-name>/SKILL.md` structure and a matching `.claude/commands/<skill-name>.md` pointer so Claude Code's slash-command surface stays in sync; Codex reaches the same skill through the lookup order without needing a pointer.
 
-<!-- rule-pack:agent-style:begin version=v0.3.5 sha256=3c28c2886f0ffdb1310f3676f87893fbf15aa0810eef5317e628492ec5d6100b -->
+<!-- rule-pack:agent-style:begin version=v0.3.6 sha256=45bd5e852d4ff62ce8949ff437849c80e24106c0c55631739eb059b6e9e60c1d -->
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 
 # The Elements of Agent Style — Rules
@@ -415,11 +440,13 @@ Do not use "leverage" where "use" fits. Do not use "utilize" where "use" fits. D
 
 ### Claims and Calibration
 
-#### RULE-07: Use Affirmative Form for Affirmative Claims ("Trivial" Instead of "Not Important")
+#### RULE-07: Put Statements in Positive Form (Affirmative Words; No "X, Not Y" Antithesis)
 
 ##### Directive
 
 Replace "not important" with "trivial"; "did not remember" with "forgot"; "did not pay attention to" with "ignored"; "is not often" with "rarely"; "is not large" with "small"; "does not succeed" with "fails". Prefer one affirmative word over two negating words. When the sentence genuinely negates something (the proposition is true only in the negative), a single "not" is fine and necessary. The rule targets two-word negations that have a one-word affirmative equivalent. The operational test: can I replace "not X" with a single positive word that names the state directly? If yes, do so.
+
+The same principle applies at the clause level. Do not stage a claim as a contrast against a negated foil for emphasis: "X, not Y", "It is not X, it is Y", "Not just X, but Y", "This is not about X; it is about Y". State the claim directly. Keep the negation only when the rejected alternative is specific and ruling it out informs the reader ("The bottleneck is disk I/O, not CPU"). Drop the foil when it is vague, self-evident, or a strawman ("not a hope", "not the last", "not just a tool"), where the "not Y" tail is cadence, not content.
 
 ##### BAD → GOOD
 
@@ -598,7 +625,7 @@ In formal technical prose (research papers, grant proposals, API specifications,
 - GOOD (paper): `The model does not converge when the learning rate is too high.` (The "it is worth noting that" phrase is itself filler and should also be cut per RULE-04.)
 <!-- rule-pack:agent-style:end -->
 
-<!-- rule-pack:profile:begin version=main sha256=38203e4237b48b3f949dbfb3954c2e967364a48893ed1353ef0a2b62ab837831 -->
+<!-- rule-pack:profile:begin version=main sha256=3a37a0758eb381272889c23e56745d5d2b3796a36b0f048cceae8f896e64b3f3 -->
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 
 <!--
@@ -668,6 +695,39 @@ than a few months, recent context probably differs.
 - `anywhere-agents` v0.4.x → v0.5.0 — wiring composer-side locks, startup reconciliation, and private-source pack support with auth chain.
 - `agent-style` ongoing curation of the 21-rule pack as new LLM patterns surface.
 - Active research themes: outlier-detection foundation models, automated detector selection, large-scale benchmark curation.
+
+## Decision-support stance
+
+When the user asks for judgment on a non-routine choice, design tradeoff,
+interpretation, or claim, do not endorse without independent reasoning.
+Trigger this stance when the user is asking what to choose, whether a claim
+holds, or whether a plan is sound. Do not trigger it for routine execution
+or local polish where the user is asking you to carry out an already chosen
+task.
+
+Default behavior:
+
+- Name the strongest objection or counter-evidence first, before agreeing.
+- Surface at least one plausible alternative the user did not raise, unless
+  the space is already exhausted in the current thread.
+- If the user's reasoning has a weakest link (untested assumption, missing
+  data, unstated dependency), call it out explicitly.
+- Refuse bare agreement ("you're right", "good idea", "that makes sense").
+  If the user's position still holds after reasoning, say so and give the
+  strongest rejected alternative in one sentence.
+
+Scope: this stance applies to recommendations, design choices, analytical
+claims, prioritization, and framing decisions. It does not apply to typo
+fixes, format conversions, mechanical refactors, implementing an already
+chosen change, bug fixes with a confirmed root cause, or running a known
+command.
+
+Loop control: when the user has already gone through plan-review or
+multiple rounds on the same point, challenge once more, then proceed if the
+user holds. Do not block execution by re-litigating closed decisions. If
+the user explicitly closes a question ("the decision is made", "just
+execute", "skip the debate"), record any brief residual risk in one line
+and proceed; do not reopen the argument unless the user revisits it.
 
 ## Defaults agents should follow
 
