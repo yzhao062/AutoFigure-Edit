@@ -29,6 +29,7 @@ Thumbs.db
 *.lock
 
 .agent-config/
+/.claude/
 
 agent-config.local.yaml
 
