@@ -35,4 +35,7 @@ agent-config.local.yaml
 
 # Personal scratch / paper drafts (kept out of public fork to protect
 # double-blind submission anonymity and keep the fork tooling-focused)
-todo/
+# Drop box for files handed to agents; keep the folder and its README
+# (must be todo/*, not todo/ -- git cannot re-include a file under an excluded directory)
+todo/*
+!todo/README.md
